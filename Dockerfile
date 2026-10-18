@@ -21,18 +21,8 @@ ENV PYTHONUNBUFFERED=1
 # Copy only requirements to cache them in docker layer
 COPY uv.lock pyproject.toml /app/
 
-# Optionall include lancedb with:
-#   docker build --build-arg INSTALL_LANCEDB=true .
-ARG INSTALL_LANCEDB=false
 RUN --mount=type=cache,target=/root/.cache/uv \
-    if [ "$INSTALL_LANCEDB" = "true" ]; then \
-        uv sync --frozen --no-install-project --no-group dev --extra lancedb; \
-    elif [ "$INSTALL_LANCEDB" = "false" ]; then \
-        uv sync --frozen --no-install-project --no-group dev; \
-    else \
-        echo "INSTALL_LANCEDB must be 'true' or 'false'" >&2; \
-        exit 2; \
-    fi
+    uv sync --frozen --no-install-project --no-group dev --extra qdrant
 
 FROM python:3.13-slim-bookworm AS runtime
 

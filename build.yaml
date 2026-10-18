@@ -1,0 +1,5 @@
+build:
+  image: registry.app.home/cluster/honcho
+
+deploy:
+  skip: true
