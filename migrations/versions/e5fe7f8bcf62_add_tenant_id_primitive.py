@@ -19,6 +19,7 @@ from alembic import op
 from migrations.utils import (
     column_exists,
     get_schema,
+    hnsw_supported,
     index_exists,
     table_exists,
 )
@@ -756,8 +757,13 @@ def upgrade() -> None:
 
 def _create_new_indexes() -> None:
     def _mk(name: str, table: str, cols: list[Any], **kw: Any) -> None:
-        if not index_exists(table, name):
-            op.create_index(name, table, cols, schema=schema, **kw)
+        if index_exists(table, name):
+            return
+        # Fork: skip HNSW on columns widened past pgvector's 2000-dim limit
+        # (external vector store handles ANN).
+        if kw.get("postgresql_using") == "hnsw" and not hnsw_supported(table):
+            return
+        op.create_index(name, table, cols, schema=schema, **kw)
 
     _mk("ix_peers_tenant_workspace", "peers", ["tenant_id", "workspace_name"])
     _mk("ix_sessions_tenant_workspace", "sessions", ["tenant_id", "workspace_name"])

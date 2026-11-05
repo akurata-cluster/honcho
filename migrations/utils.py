@@ -66,6 +66,57 @@ def index_exists(
     return any(idx["name"] == index_name for idx in indexes)
 
 
+# pgvector refuses to build an HNSW index on a `vector` column wider than this.
+PGVECTOR_HNSW_MAX_DIMS = 2000
+
+
+def vector_column_dims(table_name: str, column_name: str) -> int | None:
+    """Return the declared dimension of a pgvector column, or None if unbounded.
+
+    pgvector stores the dimension directly in ``atttypmod`` (-1 when undeclared).
+    """
+    dims = (
+        op.get_bind()
+        .execute(
+            sa.text(
+                """
+                SELECT a.atttypmod
+                FROM pg_attribute a
+                JOIN pg_class c ON c.oid = a.attrelid
+                JOIN pg_namespace n ON n.oid = c.relnamespace
+                WHERE n.nspname = :schema
+                  AND c.relname = :table
+                  AND a.attname = :column
+                  AND NOT a.attisdropped
+                """
+            ),
+            {"schema": get_schema(), "table": table_name, "column": column_name},
+        )
+        .scalar()
+    )
+    return dims if dims is not None and dims > 0 else None
+
+
+def hnsw_supported(table_name: str, column_name: str = "embedding") -> bool:
+    """Whether pgvector can build an HNSW index on this column.
+
+    False when the column has been widened past PGVECTOR_HNSW_MAX_DIMS (e.g. by
+    scripts/configure_embeddings.py for an external vector store such as Qdrant,
+    where the pgvector ANN index is unused anyway).
+    """
+    dims = vector_column_dims(table_name, column_name)
+    if dims is not None and dims > PGVECTOR_HNSW_MAX_DIMS:
+        logger.warning(
+            "Skipping HNSW index on %s.%s: %d dims exceeds pgvector's %d limit",
+            table_name,
+            column_name,
+            dims,
+            PGVECTOR_HNSW_MAX_DIMS,
+        )
+        return False
+    return True
+
+
 def constraint_exists(
     table_name: str,
     constraint_name: str,
