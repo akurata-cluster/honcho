@@ -77,6 +77,12 @@ PROVIDER_TIMEOUT_ERROR_TEXT = (
     "provider_params.timeout must be a positive number of seconds"
 )
 
+# Values of provider_params.thinking_tool_choice_conflict: what a backend does
+# when extended thinking meets a forced tool choice, which Anthropic rejects.
+THINKING_TOOL_CHOICE_CONFLICT_MODES = frozenset(
+    {"throw", "override_thinking", "override_tool"}
+)
+
 
 def coerce_provider_timeout(value: Any) -> float:
     """Coerce a `provider_params.timeout` value to positive, finite seconds.
@@ -131,8 +137,15 @@ class ModelOverrideSettings(BaseModel):
 
     @field_validator("provider_params")
     @classmethod
-    def _validate_provider_timeout(cls, v: dict[str, Any]) -> dict[str, Any]:
-        """Reject bad `timeout` values at config load; normalize good ones to float."""
+    def _validate_provider_params(cls, v: dict[str, Any]) -> dict[str, Any]:
+        """Reject bad `timeout` and `thinking_tool_choice_conflict` values at
+        config load; normalize a good timeout to float."""
+        mode = v.get("thinking_tool_choice_conflict")
+        if mode is not None and mode not in THINKING_TOOL_CHOICE_CONFLICT_MODES:
+            raise ValueError(
+                "provider_params.thinking_tool_choice_conflict must be one of "
+                + f"{sorted(THINKING_TOOL_CHOICE_CONFLICT_MODES)}, got {mode!r}"
+            )
         if "timeout" not in v:
             return v
         return {**v, "timeout": coerce_provider_timeout(v["timeout"])}
@@ -723,8 +736,27 @@ class DBSettings(HonchoSettings):
     CONNECTION_URI: str = (
         "postgresql+psycopg://postgres:postgres@localhost:5432/postgres"
     )
+    # The BYPASSRLS service role's connection URI, used by service_db() for the
+    # cross-tenant service paths (deriver claim, reconciler, dreamer, enqueue).
+    # region ai
+    # Unset → service_db() uses CONNECTION_URI (single-role), which is correct when
+    # MULTI_TENANT is off. When MULTI_TENANT is on the role split is required, so
+    # row-level security is enforced on the app role while service work can bypass
+    # it (a session that merely lacks a tenant would otherwise see zero rows).
+    # endregion
+    SERVICE_CONNECTION_URI: str | None = None
+    OWNER_CONNECTION_URI: str | None = None
     SCHEMA: str = "public"
     POOL_CLASS: str = "default"
+    # The pooling mode the deployment's connection path actually runs — hand-set
+    # (not probed) so it is auditable.
+    # region ai
+    # Only consulted when MULTI_TENANT is on: the session-scoped read-path binding
+    # LEAKS across tenants under a transaction/statement-mode pooler (backends are
+    # multiplexed below the session), so the startup tenant-isolation validator
+    # refuses to boot in that combination.
+    # endregion
+    POOLER_MODE: Literal["none", "session", "transaction", "statement"] = "session"
     POOL_PRE_PING: bool = True
     POOL_SIZE: Annotated[int, Field(default=10, gt=0, le=1000)] = 10
     MAX_OVERFLOW: Annotated[int, Field(default=20, ge=0, le=1000)] = 20
@@ -761,6 +793,23 @@ class AuthSettings(HonchoSettings):
         if self.USE_AUTH and not self.JWT_SECRET:
             raise ValueError("JWT_SECRET must be set if USE_AUTH is true")
         return self
+
+
+class TenantApiSettings(HonchoSettings):
+    model_config = SettingsConfigDict(env_prefix="TENANT_API_", extra="ignore")  # pyright: ignore
+
+    # region ai
+    # The above-tenant auth plane: this secret authenticates the operator's
+    # provisioning system (a control plane in a hosted deployment) to the
+    # tenant-registry API (/v3/tenants), never any tenant's data. It is
+    # deliberately not a JWT — under MULTI_TENANT every JWT must carry a tenant,
+    # and at tenant-creation time the tenant does not exist to be claimed, so the
+    # JWT plane cannot express this caller. Unset (the default) keeps the tenant
+    # API disabled; it is also disabled whenever MULTI_TENANT is off.
+    # Exactly one secret is accepted, so rotation under a rolling restart is a
+    # brief auth brownout — sequence the caller's secret update last.
+    # endregion
+    SECRET: str | None = None
 
 
 class SentrySettings(HonchoSettings):
@@ -883,7 +932,25 @@ class DeriverSettings(HonchoSettings):
 
     ENABLED: bool = True
 
-    WORKERS: Annotated[int, Field(default=1, gt=0, le=100)] = 1
+    # Concurrency within a single deriver process. Total worker count across a
+    # deployment is processes x WORKERS.
+    WORKERS: Annotated[int, Field(default=1, gt=0, le=512)] = 1
+    # region ai
+    # Bounds the DB-pool headroom the claim may assume per configured worker:
+    # effective concurrency = min(WORKERS, max(1, floor(ratio * (POOL_SIZE +
+    # MAX_OVERFLOW)))). Each in-flight work unit opens several SEQUENTIAL,
+    # short-lived sessions, so one pooled connection services several units —
+    # a 1:1 cap would waste real capacity, and no cap at all lets WORKERS
+    # exhaust the pool under load. The default is deliberately conservative
+    # until the sessions-per-unit ratio is measured (tracked in DEV-2744);
+    # derivation only ever LOWERS the configured WORKERS, and the queue
+    # manager logs and gauges the derived cap at boot. Deployments on
+    # NullPool (DB_POOL_CLASS="null") have no pool to protect, so the
+    # derivation is skipped there.
+    # endregion
+    WORKERS_PER_POOL_CONNECTION: Annotated[
+        float, Field(default=4.0, gt=0.0, le=64.0)
+    ] = 4.0
     POLLING_SLEEP_INTERVAL_SECONDS: Annotated[
         float, Field(default=1.0, gt=0.0, le=60.0)
     ] = 1.0
@@ -976,6 +1043,11 @@ class DeriverSettings(HonchoSettings):
     FLUSH_ENABLED: bool = False
 
     BACKLOG_METRICS_POLL_INTERVAL_SECONDS: Annotated[int, Field(default=30, ge=1)] = 30
+
+    # Per-tenant claim metrics (claims, claim wait, in-flight units), for
+    # measuring how fairly a shared deriver serves its tenants. Off by default:
+    # each adds a series set per tenant. Needs METRICS_ENABLED too.
+    TENANT_FAIRNESS_METRICS: bool = False
 
     SCHEDULER: Literal["api", "deriver"] = "deriver"
 
@@ -1102,11 +1174,24 @@ class DialecticSettings(HonchoSettings):
     MAX_OUTPUT_TOKENS: Annotated[int, Field(default=8192, gt=0, le=100_000)] = 8192
     MAX_INPUT_TOKENS: Annotated[int, Field(default=100_000, gt=0, le=200_000)] = 100_000
 
+    # Longest peer chat query accepted, in characters. Raise it for clients
+    # that quote recent conversation turns in the query. Workspace chat keeps
+    # its own fixed limit.
+    MAX_QUERY_LENGTH: Annotated[int, Field(default=10_000, gt=0, le=200_000)] = 10_000
+
     # Extra tool rounds workspace chat gets on top of its level's limit. A
     # workspace query fans out over peers where a pair query reads one
     # representation, so it needs room to route and then recall. Not applied at
     # "minimal", whose single round is the point of the level.
     WORKSPACE_EXTRA_TOOL_ITERATIONS: Annotated[int, Field(default=3, ge=0, le=20)] = 3
+
+    # Show a tool-call budget line after each round, at levels allowing three
+    # or more tool iterations.
+    BUDGET_ENABLED: bool = False
+    # Add the memory-layout section to the system prompt and, for unrestricted
+    # pair queries, conclusion counts and the dreamer's `map` notes (when
+    # DREAM_NOTES_MODE=on) to the first message.
+    BRIEF_ENABLED: bool = False
 
     # Session history injection: max tokens of recent messages to include when session_id is specified.
     # Set to 0 to disable automatic session history injection.
@@ -1229,6 +1314,13 @@ class SummarySettings(HonchoSettings):
     MAX_TOKENS_SHORT: Annotated[int, Field(default=1500, gt=0, le=10_000)] = 1500
     MAX_TOKENS_LONG: Annotated[int, Field(default=6000, gt=0, le=20_000)] = 6000
 
+    # Input budget for one summary call: prompt, previous summary and messages.
+    # The message window is chosen by count, so long messages can outgrow the
+    # model's context window; the oldest messages in the window are dropped to
+    # fit. A fixed budget, like DIALECTIC_MAX_INPUT_TOKENS, kept well under the
+    # context windows of the configured model and its fallback.
+    MAX_INPUT_TOKENS: Annotated[int, Field(default=100_000, gt=0, le=200_000)] = 100_000
+
     @model_validator(mode="after")
     def _validate_caps_within_model_ceiling(self) -> "SummarySettings":
         """Keep MODEL_CONFIG.max_output_tokens a ceiling over both summary caps."""
@@ -1241,6 +1333,22 @@ class SummarySettings(HonchoSettings):
                     f"summary.{name} must not exceed "
                     + "summary.MODEL_CONFIG.max_output_tokens"
                 )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_input_budget_fits_previous_summary(self) -> "SummarySettings":
+        """Leave room for messages after the largest possible previous summary.
+
+        A previous summary is sent in full and can be as long as its cap, which
+        may be either one. Requiring twice the larger cap leaves at least that
+        much again for the prompt and messages.
+        """
+        minimum_budget = 2 * max(self.MAX_TOKENS_SHORT, self.MAX_TOKENS_LONG)
+        if minimum_budget > self.MAX_INPUT_TOKENS:
+            raise ValueError(
+                "summary.MAX_INPUT_TOKENS must be at least twice the larger of "
+                + "summary.MAX_TOKENS_SHORT and summary.MAX_TOKENS_LONG"
+            )
         return self
 
 
@@ -1329,6 +1437,8 @@ class CacheSettings(HonchoSettings):
     CLUSTER: bool = False
     CONNECT_TIMEOUT_SECONDS: Annotated[float, Field(default=5.0, gt=0, le=60)] = 5.0
     CONNECT_RETRIES: Annotated[int, Field(default=3, ge=0, le=10)] = 3
+    # Redis connections per process (per node with CLUSTER). cashews defaults to 10.
+    MAX_CONNECTIONS: Annotated[int, Field(default=50, gt=0, le=10_000)] = 50
     NAMESPACE: str | None = None
     DEFAULT_TTL_SECONDS: Annotated[int, Field(default=300, ge=1, le=86_400)] = (
         300  # how long to keep items in cache
@@ -1394,8 +1504,42 @@ class DreamSettings(HonchoSettings):
     MAX_ENQUEUED_PER_POLL: Annotated[int, Field(default=100, gt=0, le=10_000)] = 100
     ENABLED_TYPES: list[str] = ["omni"]
 
-    # Agent iteration limit - increased for extended reasoning workflow
+    # Card-refresh dreams only; capped further by the specialist's own ceiling.
+    # Deduction and induction use the per-specialist limits below.
     MAX_TOOL_ITERATIONS: Annotated[int, Field(default=20, gt=0, le=50)] = 20
+    DEDUCTION_MAX_TOOL_ITERATIONS: Annotated[int, Field(default=12, ge=1, le=50)] = 12
+    INDUCTION_MAX_TOOL_ITERATIONS: Annotated[int, Field(default=10, ge=1, le=50)] = 10
+    # Deduction and induction start with a description of how memory is
+    # organized and conclusion counts by level.
+    BRIEF_ENABLED: bool = False
+    # Cap on the since-last-dream work list in the brief. A larger backlog is
+    # worked through over consecutive dreams.
+    BRIEF_MAX_NEW_CONCLUSIONS: Annotated[int, Field(default=50, ge=1, le=500)] = 50
+    # Token cap on the same list: conclusions created through the API can be
+    # long. At least one is always shown, so one huge conclusion can't stall it.
+    BRIEF_MAX_NEW_CONCLUSION_TOKENS: Annotated[
+        int, Field(default=8000, ge=500, le=100_000)
+    ] = 8000
+    # Deduction and induction see a tool-call budget line, the last iterations
+    # are reserved for writes, and the final call at the limit can still write.
+    BUDGET_ENABLED: bool = False
+    # Working notes carried between dreams: "off", "shadow" (written but never
+    # loaded, so a sample can be judged) or "on".
+    NOTES_MODE: Literal["off", "shadow", "on"] = "off"
+    # Split evenly between deduction's and induction's own entries.
+    NOTES_MAX_TOKENS: Annotated[int, Field(default=3000, ge=100, le=20_000)] = 3000
+    # Iterations reserved for writes at the end of a pass. Unset means 15% of
+    # the specialist's limit, rounded, with a minimum of one, and at most one
+    # less than the limit.
+    WRITE_WINDOW_ITERATIONS: Annotated[int | None, Field(default=None, ge=1, le=50)] = (
+        None
+    )
+    # Representation History: each dream's created and removed conclusions and
+    # peer-card changes, readable through the dreams API. Past the retention
+    # window the reconciler prunes a run to the created conclusions that still
+    # exist, and deletes it once none do.
+    HISTORY_ENABLED: bool = True
+    HISTORY_RETENTION_DAYS: Annotated[int, Field(default=30, ge=1, le=3650)] = 30
 
     @staticmethod
     def _DEDUCTION_MODEL_CONFIG_DEFAULT() -> ConfiguredModelSettings:
@@ -1582,6 +1726,7 @@ class AppSettings(HonchoSettings):
     )
 
     MAX_MESSAGE_SIZE: Annotated[int, Field(default=25_000, gt=0)] = 25_000
+    PAGINATION_COUNT_LIMIT: Annotated[int, Field(default=100_000, ge=1)] = 100_000
     EMBED_MESSAGES: bool = True
     LANGFUSE_HOST: str | None = None
     LANGFUSE_PUBLIC_KEY: str | None = None
@@ -1604,9 +1749,25 @@ class AppSettings(HonchoSettings):
 
     NAMESPACE: str = "honcho"  # Top-level namespace for all settings, can be overridden by nested-model settings
 
+    # Multi-tenant isolation toggle (default off = single-tenant).
+    # region ai
+    # When on, tenant-scoped DB sessions carry a request-scoped `app.tenant` GUC
+    # so Postgres row-level-security policies resolve, and `tracked_db` requires a
+    # tenant_id (failing closed if it is absent). When off, no tenant is bound and
+    # Honcho runs as a plain single-tenant app on RLS-free Postgres.
+    # endregion
+    MULTI_TENANT: bool = False
+
+    # The tenant that owns this instance's data, when MULTI_TENANT is off.
+    TENANT_ID: Annotated[
+        str | None,
+        Field(min_length=1, max_length=128, pattern=r"^[a-zA-Z0-9_-]+$"),
+    ] = None
+
     # Nested settings models
     DB: DBSettings = Field(default_factory=DBSettings)
     AUTH: AuthSettings = Field(default_factory=AuthSettings)
+    TENANT_API: TenantApiSettings = Field(default_factory=TenantApiSettings)
     SENTRY: SentrySettings = Field(default_factory=SentrySettings)
     LLM: LLMSettings = Field(default_factory=LLMSettings)
     EMBEDDING: EmbeddingSettings = Field(default_factory=EmbeddingSettings)

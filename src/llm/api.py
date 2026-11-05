@@ -12,7 +12,7 @@ Orchestrates:
 from __future__ import annotations
 
 import logging
-from collections.abc import AsyncIterator, Callable, Collection
+from collections.abc import AsyncIterator, Callable, Collection, Sequence
 from typing import Any, Literal, TypeVar, cast, overload
 
 from pydantic import BaseModel
@@ -23,7 +23,9 @@ from src.config import ConfiguredModelSettings, ModelConfig
 from src.exceptions import ValidationException
 from src.telemetry.reasoning_traces import log_reasoning_trace
 
+from .errors import llm_retry_condition
 from .executor import honcho_llm_call_inner
+from .messages import ChatMessage, UserMessage, coerce_messages
 from .runtime import (
     AttemptPlan,
     CapturedAgentSpan,
@@ -35,6 +37,7 @@ from .runtime import (
 )
 from .tool_loop import execute_tool_loop
 from .types import (
+    BudgetLine,
     HonchoLLMCallResponse,
     HonchoLLMCallStreamChunk,
     IterationCallback,
@@ -46,6 +49,12 @@ from .types import (
 logger = logging.getLogger(__name__)
 
 M = TypeVar("M", bound=BaseModel)
+
+
+def _trace_messages(history: list[ChatMessage] | None) -> list[dict[str, Any]] | None:
+    if history is None:
+        return None
+    return [message.model_dump(mode="json") for message in history]
 
 
 @overload
@@ -72,7 +81,9 @@ async def honcho_llm_call(
     max_tool_iterations: int = 10,
     force_tools_until: Collection[str] | None = None,
     max_forced_iterations: int = 3,
-    messages: list[dict[str, Any]] | None = None,
+    budget_line: BudgetLine | None = None,
+    final_call_tools: list[dict[str, Any]] | None = None,
+    messages: Sequence[ChatMessage | dict[str, Any]] | None = None,
     max_input_tokens: int | None = None,
     trace_name: str | None = None,
     iteration_callback: IterationCallback | None = None,
@@ -105,7 +116,9 @@ async def honcho_llm_call(
     max_tool_iterations: int = 10,
     force_tools_until: Collection[str] | None = None,
     max_forced_iterations: int = 3,
-    messages: list[dict[str, Any]] | None = None,
+    budget_line: BudgetLine | None = None,
+    final_call_tools: list[dict[str, Any]] | None = None,
+    messages: Sequence[ChatMessage | dict[str, Any]] | None = None,
     max_input_tokens: int | None = None,
     trace_name: str | None = None,
     iteration_callback: IterationCallback | None = None,
@@ -138,7 +151,9 @@ async def honcho_llm_call(
     max_tool_iterations: int = 10,
     force_tools_until: Collection[str] | None = None,
     max_forced_iterations: int = 3,
-    messages: list[dict[str, Any]] | None = None,
+    budget_line: BudgetLine | None = None,
+    final_call_tools: list[dict[str, Any]] | None = None,
+    messages: Sequence[ChatMessage | dict[str, Any]] | None = None,
     max_input_tokens: int | None = None,
     trace_name: str | None = None,
     iteration_callback: IterationCallback | None = None,
@@ -170,7 +185,9 @@ async def honcho_llm_call(
     max_tool_iterations: int = 10,
     force_tools_until: Collection[str] | None = None,
     max_forced_iterations: int = 3,
-    messages: list[dict[str, Any]] | None = None,
+    budget_line: BudgetLine | None = None,
+    final_call_tools: list[dict[str, Any]] | None = None,
+    messages: Sequence[ChatMessage | dict[str, Any]] | None = None,
     max_input_tokens: int | None = None,
     trace_name: str | None = None,
     iteration_callback: IterationCallback | None = None,
@@ -186,6 +203,12 @@ async def honcho_llm_call(
     Backup provider/model (if configured on the primary ModelConfig's
     `fallback`) is used on the final retry attempt, which is 3 by default.
 
+    A provider rejection of the request itself (a 4xx other than
+    408/409/425/429; see `is_non_retryable_client_error`) is not retried when
+    no fallback is configured, since the same model would reject it again.
+    With a fallback it is retried as before, so the fallback still gets its
+    attempt.
+
     A caller-supplied `run` stays owned by the caller; otherwise the call opens
     and ends its own around the tool loop.
 
@@ -193,14 +216,18 @@ async def honcho_llm_call(
     call, so raising from it consumes an attempt exactly like a provider error:
     it is retried and reaches the fallback on the final attempt (with
     `enable_retry=False`, the first raise propagates). It sees the response
-    before call-level fields such as `hit_input_token_cap` are set. Tool-less,
-    non-streaming calls only.
+    before call-level fields such as `hit_input_token_cap` are set, and a
+    response it rejects is recorded in telemetry as a failed attempt, output
+    included. Tool-less, non-streaming calls only.
 
     Raises:
         ValidationException: If streaming and tool calling are combined
                              without `stream_final_only=True`.
     """
     runtime_model_config = resolve_runtime_model_config(model_config)
+    # Typed once here; everything below carries `history`, and each attempt
+    # renders it for its own provider.
+    history = coerce_messages(messages) if messages else None
 
     # Caller kwargs left at None are resolved downstream by
     # effective_config_for_call against whichever ModelConfig wins the
@@ -284,9 +311,8 @@ async def honcho_llm_call(
             selected_config=plan.selected_config,
             plan=plan,
             telemetry=telemetry,
+            validate_response=validate_response,
         )
-        if validate_response is not None:
-            validate_response(response)
         return response
 
     decorated = _call_with_provider_selection
@@ -311,8 +337,17 @@ async def honcho_llm_call(
             )
             logger.info(f"Will retry with attempt {next_attempt}/{retry_attempts}")
 
+    # Stops early only without a fallback, so the attempts it stops are always
+    # the primary's.
+    retry_condition = llm_retry_condition(
+        can_fall_back=runtime_model_config.fallback is not None,
+        retry_attempts=retry_attempts,
+        model=f"{runtime_model_config.transport}/{runtime_model_config.model}",
+    )
+
     if enable_retry:
         decorated = retry(
+            retry=retry_condition,
             stop=stop_after_attempt(retry_attempts),
             wait=wait_exponential(multiplier=1, min=4, max=10),
             before_sleep=before_retry_callback,
@@ -358,11 +393,11 @@ async def honcho_llm_call(
         # (the deriver's prompt-only case) would otherwise silently fly
         # through with hit=False. Token-based comparison catches it.
         toolless_hit_input_token_cap = False
-        toolless_messages = messages
+        toolless_messages = history
         if max_input_tokens is not None:
             from .conversation import count_message_tokens, truncate_messages_to_fit
 
-            base_messages = messages or [{"role": "user", "content": prompt}]
+            base_messages = history or [UserMessage(content=prompt)]
             toolless_hit_input_token_cap = (
                 count_message_tokens(base_messages) > max_input_tokens
             )
@@ -423,9 +458,8 @@ async def honcho_llm_call(
                     plan=plan,
                     telemetry=telemetry,
                     messages=captured_messages,
+                    validate_response=validate_response,
                 )
-                if validate_response is not None:
-                    validate_response(response)
                 return response
 
             wrapped = _toolless_call
@@ -433,6 +467,7 @@ async def honcho_llm_call(
                 wrapped = ai_track(sentry_track_name)(wrapped)
             if enable_retry:
                 wrapped = retry(
+                    retry=retry_condition,
                     stop=stop_after_attempt(retry_attempts),
                     wait=wait_exponential(multiplier=1, min=4, max=10),
                     before_sleep=before_retry_callback,
@@ -462,7 +497,7 @@ async def honcho_llm_call(
                 reasoning_effort=_trace_reasoning_effort(),
                 json_mode=json_mode,
                 stop_seqs=_trace_stop_seqs(),
-                messages=messages,
+                messages=_trace_messages(history),
             )
         return result
 
@@ -483,13 +518,15 @@ async def honcho_llm_call(
         result = await execute_tool_loop(
             prompt=prompt,
             max_tokens=max_tokens,
-            messages=messages,
+            messages=history,
             tools=tools,
             tool_choice=tool_choice,
             tool_executor=tool_executor,
             max_tool_iterations=max_tool_iterations,
             force_tools_until=force_tools_until,
             max_forced_iterations=max_forced_iterations,
+            budget_line=budget_line,
+            final_call_tools=final_call_tools,
             response_model=response_model,
             json_mode=json_mode,
             temperature=temperature,
@@ -500,6 +537,7 @@ async def honcho_llm_call(
             max_input_tokens=max_input_tokens,
             get_attempt_plan=_get_attempt_plan,
             before_retry_callback=before_retry_callback,
+            retry_condition=retry_condition,
             stream_final=stream_final_only,
             iteration_callback=iteration_callback,
             telemetry=telemetry,
@@ -529,7 +567,7 @@ async def honcho_llm_call(
             reasoning_effort=_trace_reasoning_effort(),
             json_mode=json_mode,
             stop_seqs=_trace_stop_seqs(),
-            messages=messages,
+            messages=_trace_messages(history),
         )
     return result
 

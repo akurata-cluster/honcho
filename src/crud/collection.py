@@ -1,8 +1,12 @@
+from collections.abc import Sequence
+from datetime import datetime
 from logging import getLogger
-from typing import Any
+from typing import Any, cast
 
 from cashews import NOT_NONE
-from sqlalchemy import select, update
+from sqlalchemy import ColumnElement, func, literal, select, update
+from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.engine import CursorResult
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import make_transient_to_detached
@@ -12,6 +16,7 @@ from src.cache.client import (
     cache,
     cache_key_namespace,
     cache_prefix_namespace,
+    fallback_on_cache_error,
     safe_cache_delete,
     safe_cache_set,
 )
@@ -39,6 +44,7 @@ def collection_cache_key(workspace_name: str, observer: str, observed: str) -> s
     )
 
 
+@fallback_on_cache_error
 @cache(
     key=COLLECTION_CACHE_KEY_TEMPLATE,
     ttl=f"{settings.CACHE.DEFAULT_TTL_SECONDS}s",
@@ -125,7 +131,7 @@ async def get_collection(
     if data is None:
         raise ResourceNotFoundException("Collection not found")
     # Reconstruct ORM object from cached dict and merge into session
-    obj = models.Collection(**data)
+    obj = models.Collection(**models.with_cached_tenant(data))
     make_transient_to_detached(obj)
     collection = await db.merge(obj, load=False)
     return collection
@@ -203,3 +209,127 @@ async def update_collection_internal_metadata(
     await db.commit()
 
     await safe_cache_delete(collection_cache_key(workspace_name, observer, observed))
+
+
+async def get_collection_internal_metadata_value(
+    db: AsyncSession,
+    workspace_name: str,
+    observer: str,
+    observed: str,
+    key: str,
+) -> Any | None:
+    """Read one top-level internal_metadata value straight from the database.
+
+    Skips the collection cache, which can lag writes made by
+    `merge_collection_internal_metadata_value`. Returns None when the
+    collection or the key is missing.
+    """
+    return await db.scalar(
+        select(models.Collection.internal_metadata[key]).where(
+            models.Collection.workspace_name == workspace_name,
+            models.Collection.observer == observer,
+            models.Collection.observed == observed,
+        )
+    )
+
+
+async def merge_collection_internal_metadata_value(
+    db: AsyncSession,
+    workspace_name: str,
+    observer: str,
+    observed: str,
+    key: str,
+    patch: dict[str, Any],
+    *,
+    commit: bool = True,
+    if_unchanged: tuple[str, str | None] | None = None,
+) -> bool:
+    """Merge `patch` into the object stored under one top-level key, server-side.
+
+    `update_collection_internal_metadata` replaces a top-level value whole, so
+    two writers of different sub-keys under the same key would overwrite each
+    other. This merges one level deeper (`value || patch`) in a single UPDATE,
+    so it needs no row lock: writers of different sub-keys never collide.
+
+    With `commit=False` the update joins the caller's transaction, and the
+    caller calls `invalidate_collection_cache` once that commits.
+
+    With `if_unchanged=(subkey, value)`, the write happens only while the
+    string stored under `subkey` still equals `value` (None: absent), so a
+    writer that read before another reset the value can't write over it.
+
+    Returns:
+        Whether a row was written.
+    """
+    current = func.coalesce(
+        models.Collection.internal_metadata[key], func.jsonb_build_object()
+    )
+    conditions = [
+        models.Collection.workspace_name == workspace_name,
+        models.Collection.observer == observer,
+        models.Collection.observed == observed,
+    ]
+    if if_unchanged is not None:
+        subkey, expected = if_unchanged
+        stored = models.Collection.internal_metadata.op("->")(key).op("->>")(subkey)
+        conditions.append(stored.is_(None) if expected is None else stored == expected)
+    stmt = (
+        update(models.Collection)
+        .where(*conditions)
+        .values(
+            internal_metadata=models.Collection.internal_metadata.op("||")(
+                func.jsonb_build_object(key, current.op("||")(literal(patch, JSONB)))
+            )
+        )
+    )
+    result = cast(CursorResult[Any], await db.execute(stmt))
+    written = result.rowcount > 0
+    if commit:
+        await db.commit()
+        await invalidate_collection_cache(workspace_name, observer, observed)
+    return written
+
+
+async def invalidate_collection_cache(
+    workspace_name: str, observer: str, observed: str
+) -> None:
+    """Drop a collection's cached row after a write to it commits."""
+    await safe_cache_delete(collection_cache_key(workspace_name, observer, observed))
+
+
+async def record_explicit_documents(
+    db: AsyncSession, docs: Sequence[models.Document]
+) -> None:
+    """Add new explicit documents to their collections' explicit_count and newest_explicit_at."""
+    explicit = [doc for doc in docs if doc.level == "explicit"]
+    if not explicit:
+        return
+    await db.flush()
+    groups: dict[tuple[str, str, str, str], list[datetime | None]] = {}
+    for doc in explicit:
+        key = (doc.tenant_id, doc.workspace_name, doc.observer, doc.observed)
+        groups.setdefault(key, []).append(doc.__dict__.get("created_at"))
+    for key in sorted(groups):
+        tenant_id, workspace_name, observer, observed = key
+        created = groups[key]
+        newest: ColumnElement[datetime] = (
+            func.now()
+            if any(c is None for c in created)
+            else literal(max(c for c in created if c is not None))
+        )
+        await db.execute(
+            update(models.Collection)
+            .where(
+                models.Collection.tenant_id == tenant_id,
+                models.Collection.workspace_name == workspace_name,
+                models.Collection.observer == observer,
+                models.Collection.observed == observed,
+            )
+            .values(
+                explicit_count=models.Collection.explicit_count + len(created),
+                newest_explicit_at=func.greatest(
+                    func.coalesce(models.Collection.newest_explicit_at, newest),
+                    newest,
+                ),
+            )
+        )

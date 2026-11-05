@@ -12,6 +12,8 @@ from typing import TYPE_CHECKING, Any, Generic, Literal, TypeVar
 
 from pydantic import BaseModel, Field
 
+from .messages import AIMessage
+
 if TYPE_CHECKING:
     from anthropic import AsyncAnthropic
     from google import genai
@@ -133,6 +135,11 @@ class LLMTelemetryContext:
 
 IterationCallback = Callable[[IterationData], None]
 
+# Called after each round of tool results with (rounds used, round limit). A
+# returned string is appended to the end of the conversation as a user turn so
+# the model can see how much of its budget is left; None appends nothing.
+BudgetLine = Callable[[int, int], str | None]
+
 
 class HonchoLLMCallResponse(BaseModel, Generic[T]):
     """Response object for LLM calls.
@@ -153,9 +160,10 @@ class HonchoLLMCallResponse(BaseModel, Generic[T]):
     iterations: int = 0
     """Number of LLM calls made in the tool execution loop."""
     thinking_content: str | None = None
-    # Full thinking blocks with signatures for multi-turn replay (Anthropic only).
+    # Anthropic thinking blocks, with signatures, as the provider returned them.
+    # Replay goes through `message.reasoning`.
     thinking_blocks: list[dict[str, Any]] = Field(default_factory=list)
-    # OpenRouter reasoning_details for Gemini models — must be preserved across turns.
+    # OpenAI-compatible reasoning_details (e.g. OpenRouter) as returned.
     reasoning_details: list[dict[str, Any]] = Field(default_factory=list)
     # True when the original input exceeded `max_input_tokens` — covers
     # both "messages were dropped" and "couldn't drop the last unit and
@@ -163,6 +171,11 @@ class HonchoLLMCallResponse(BaseModel, Generic[T]):
     # case). Maps 1:1 to `RepresentationCompletedEvent.hit_input_token_cap`
     # and `DialecticCompletedEvent.hit_input_token_cap`.
     hit_input_token_cap: bool = False
+    # True when the tool loop ran out of iterations and made its final call
+    # without a natural stop.
+    hit_iteration_limit: bool = False
+    # The assistant turn this response carries, ready to append to a history.
+    message: AIMessage | None = None
 
 
 # Finish reasons arrive provider-native (never normalized by the executor), so
@@ -247,6 +260,7 @@ class StreamingResponseWithMetadata:
     thinking_content: str | None
     iterations: int
     hit_input_token_cap: bool
+    hit_iteration_limit: bool
     _run_span: Any | None
 
     def __init__(
@@ -261,6 +275,7 @@ class StreamingResponseWithMetadata:
         iterations: int = 0,
         hit_input_token_cap: bool = False,
         run_span: Any | None = None,
+        hit_iteration_limit: bool = False,
     ):
         self._stream = stream
         self.tool_calls_made = tool_calls_made
@@ -271,6 +286,7 @@ class StreamingResponseWithMetadata:
         self.thinking_content = thinking_content
         self.iterations = iterations
         self.hit_input_token_cap = hit_input_token_cap
+        self.hit_iteration_limit = hit_iteration_limit
         self._run_span = run_span
 
     def __aiter__(self) -> AsyncIterator[HonchoLLMCallStreamChunk]:
@@ -320,6 +336,7 @@ class StreamingResponseWithMetadata:
 __all__ = [
     "HonchoLLMCallResponse",
     "HonchoLLMCallStreamChunk",
+    "BudgetLine",
     "IterationCallback",
     "IterationData",
     "LLMTelemetryContext",
